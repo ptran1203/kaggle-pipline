@@ -32,7 +32,7 @@ class Trainer:
         self.args = args
         self.device = torch.device(args.device)
         self.model = model.to(self.device)
-        self.criterion = LossFunction()
+        self.criterion = nn.CrossEntropyLoss()
 
         os.makedirs(args.checkpoint_dir, exist_ok=True)
 
@@ -85,11 +85,10 @@ class Trainer:
         train_data = df[df.fold != fold].reset_index(drop=True)
         val_data = df[df.fold == fold].reset_index(drop=True)
 
-        train_data = MyDataset(train_data, transform=train_transform(),
+        train_data = MyDataset(train_data, is_train=True,
                                img_size=self.args.img_size)
 
-        val_data= MyDataset(val_data, transform=val_transform(),
-                            img_size=self.args.img_size)
+        val_data= MyDataset(val_data, img_size=self.args.img_size)
         
         train_loader = DataLoader(train_data,
                                 shuffle=True,
@@ -134,9 +133,11 @@ class Trainer:
 
             val_loss = self.val_one_epoch(valid_loader)
 
+            print(f'Epoch {e + 1}/{epochs}: Train loss {train_loss}, Val loss {val_loss}')
+
             if val_loss < best_loss:
                 print(f'Valid loss improved from {best_loss} to {val_loss}')
                 best_loss = val_loss
                 self.save_checkpoint(fold)
 
-        return best_auc
+        return best_loss

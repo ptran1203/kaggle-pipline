@@ -6,7 +6,7 @@ from dataloader.augment import train_transform, valid_transform
 
 
 class MyDataset(Dataset):
-    def __init__(self, df, is_train=True, img_size=512):
+    def __init__(self, df, is_train=False, img_size=512):
         self.df = df
         self.transform = train_transform() if is_train else valid_transform()
         self.img_size = img_size
