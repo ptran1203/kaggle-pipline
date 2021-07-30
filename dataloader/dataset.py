@@ -2,14 +2,14 @@ import cv2
 import torch
 import numpy as np
 from torch.utils.data import Dataset
-from dataloader.augment import train_transform, valid_transform
 
 
 class MyDataset(Dataset):
-    def __init__(self, df, is_train=False, img_size=512):
+    def __init__(self, df, transform=None, img_size=512, return_path=False):
         self.df = df
-        self.transform = train_transform() if is_train else valid_transform()
+        self.transform = transform
         self.img_size = img_size
+        self.return_path = return_path
 
     def __len__(self):
         return(len(self.df))
@@ -26,7 +26,11 @@ class MyDataset(Dataset):
         if self.transform:
             image = self.transform(image=image)['image']
 
+        image = torch.tensor(image)
         # Channel last -> channel first
         image = image.permute(2, 0, 1)
 
-        return image, target
+        if self.return_path:
+            return path, image, target
+        else:
+            return image, target

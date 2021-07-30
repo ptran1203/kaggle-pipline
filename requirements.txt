@@ -1,1 +1,2 @@
-albumentations==1.0.0
+albumentations==1.0.3
+timm
