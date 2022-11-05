@@ -1,205 +1,248 @@
-import os
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import glob
-import numpy as np
-from sklearn.metrics import roc_auc_score
-from utils.log import log_info, log_warn
-from utils.common import deprocess
-from utils.plots import plot_data
-from dataloader.augment import train_transform, valid_transform
-from torch.utils.data import DataLoader
-from dataloader.dataset import MyDataset
+import torch.cuda.amp as amp
 from tqdm import tqdm
+from collections import defaultdict
+import logging
+import time
 
-LABELS = ['healthy', 'multiple_diseases', 'rust', 'scab']
+def get_train_logger(log_dir='./logs'):
+    logger = logging.getLogger('trainer')
+    logger.setLevel(logging.DEBUG)
+    fh = logging.FileHandler(os.path.join(log_dir, 'train.log'))
+    fh.setLevel(logging.DEBUG)
+    logger.addHandler(fh)
+    return logger
 
-class AverageMeter(object):
-    """Computes and stores the average and current value"""
-    def __init__(self):
-        self.reset()
+def denorm(img):
+    mean = np.array([0.485, 0.456, 0.406])
+    std = np.array([0.229, 0.224, 0.225])
+    img = img * std + mean
+    return (img[:,:,::-1] * 255).astype(np.uint8)
 
-    def reset(self):
-        self.val = 0
-        self.avg = 0
-        self.sum = 0
-        self.count = 0
+def compute_video_metrics(preds):
+    """
+    preds: List of (fname, uid, label, pred)
+    """
+    df = pd.DataFrame(preds, columns=['fname', 'uid', 'label', 'pred'])
+    gdf =  df.groupby('uid')[['label', 'pred']].mean().reset_index()
+    return (gdf['label'] == ( gdf['pred'] >= 0.5).astype(int)).mean()
 
-    def update(self, val, n=1):
-        self.val = val
-        self.sum += val * n
-        self.count += n
-        self.avg = self.sum / self.count
+class Trainer:
+    def __init__(self, model, optimizer, criterion=None, scheduler=None, cfg=None):
+        self.model = model
+        self.model_name = model.__class__.__name__
+        self.optim = optimizer
+        self.cfg = cfg
+        self.scheduler = scheduler
+        self.best_score = 100
+        self.criterion = criterion
+        self.scaler = amp.GradScaler()
+        if not isinstance(cfg.device, str):
+            self.device = cfg.device
+        else:
+            self.device = torch.device(("cuda" if torch.cuda.is_available() else "cpu"))
+        
+        print("device", self.device, type(self.device))
 
+    def init_logger(self, log_dir):
+        self.logger = get_train_logger(log_dir)
 
-class ClassificationTrainer:
-    def __init__(self, model, args):
-        self.args = args
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        self.model = model.to(self.device)
-        self.criterion = nn.CrossEntropyLoss()
-        self.weight_dir = os.path.join(self.args.work_dir, 'weights')
-        self.augment_level = 0
-        self.increase_augment_epochs = [int(c.strip()) for c in self.args.increase_augment_at.split(',')]
-        os.makedirs(self.weight_dir, exist_ok=True)
-
-    def train_one_epoch(self, train_loader):
-        losses = AverageMeter()
+    def train_epoch(self, loader, epoch=0):
+        """
+        Train one epoch
+        Args:
+            loader: data loader
+            optim: optimizer
+            loss_func: loss function
+            device: device
+        Returns([dict]): metric score, e.g: {'f1': 0.99}
+        """
         self.model.train()
 
-        loop = tqdm(train_loader)
-        preds = []
-        y_true = []
+        bar = tqdm(loader)
+        scores = defaultdict(list)
 
-        for image, labels in loop:
-            self.optimizer.zero_grad()
+        for batch_idx, sample in enumerate(bar):
+            images = sample['image']
+            labels = sample['label']
+            # uids = sample['uid']
 
-            image = image.to(self.device)
-            labels= labels.to(self.device)
+            if epoch >= self.cfg.warmup_epochs and np.random.rand() <= self.cfg.mixup:
+                shuffle_indices = torch.randperm(images.size(0))
+                indices = torch.arange(images.size(0))
+                lam = np.clip(np.random.beta(1.0, 1.0), 0.35, 0.65)
+                images = lam * images + (1 - lam) * images[shuffle_indices, :]
+                labels = lam * labels + (1 - lam) * labels[shuffle_indices, :]
 
-            output = self.model(image)
-            loss = self.criterion(output, labels)
-            loss.backward()
-
-            # Loss
-            loss = loss.cpu().detach().numpy()
-            losses.update(loss, image.shape[0])
-            preds.append(F.softmax(output, dim=1).cpu().detach().numpy())
-            y_true.append(labels.cpu().detach().numpy())
-
-            self.optimizer.step()
-
-        preds = np.concatenate(preds)
-        y_true = np.concatenate(y_true)
-
-        auc = roc_auc_score(y_true, preds, multi_class='ovr')
+            images = images.to(self.device)
+            labels = labels.to(self.device).float()
     
-        return losses.avg, auc
+            do_update = ((batch_idx + 1) % self.cfg.gradient_accum_steps == 0) or (batch_idx + 1 == len(loader))
+            
+            with amp.autocast():
+                pred = self.model(images)
+                loss = self.criterion(pred, labels)
+                self.scaler.scale(loss).backward()
+                if do_update:
+                    self.scaler.step(self.optim)
+                    self.scaler.update()
+                    self.optim.zero_grad()
+        
+            # Compute metric score
+            loss = loss.item() * self.cfg.gradient_accum_steps
+            msg_loss = f"loss: {loss:.4f}"
+            bar.set_description(msg_loss)
+            scores["loss"].append(loss)
+        scores = {k: (np.mean(v) if isinstance(v, list) else v) for k, v in scores.items()}
+        
+        return scores
 
-    def val_one_epoch(self, loader):
-        losses = AverageMeter()
-
+    def val_epoch(self, loader, epoch=0):
+        """
+        Train one epoch
+        Args:
+            loader: data loader
+            optim: optimizer
+            loss_func: loss function
+            device: device
+        Returns([dict]): metric score, e.g: {'f1': 0.99}
+        """
         self.model.eval()
 
+        bar = tqdm(loader)
+        scores = defaultdict(list)
         preds = []
-        y_true = []
-        
-        for image, labels in loader:
-            image = image.to(self.device)
-            labels = labels.to(self.device)
 
-            with torch.no_grad():
-                output = self.model(image)
-
-            loss = self.criterion(output, labels)
-            loss = loss.cpu().detach().numpy()
-            losses.update(loss, image.shape[0])
-
-            preds.append(F.softmax(output, dim=1).cpu().detach().numpy())
-            y_true.append(labels.cpu().detach().numpy())
+        with torch.no_grad():
+            for batch_idx, sample in enumerate(bar):
+                images = sample['image']
+                labels = sample['label']
+                uids = sample['uid']
+                fnames = sample['fname']
+                images = images.to(self.device)
+                labels = labels.to(self.device).float()
             
-        preds = np.concatenate(preds)
-        y_true = np.concatenate(y_true)
+                with amp.autocast():
+                    pred = self.model(images)
+                    loss = self.criterion(pred, labels)
 
-        auc = roc_auc_score(y_true, preds, multi_class='ovr')
+                # Compute metric score
+                pred = torch.sigmoid(pred)
+                pred = pred.cpu().numpy()
+                cls_pred = (pred >= 0.5).astype(int)
+                loss = loss.item() * self.cfg.gradient_accum_steps
+                labels_np = labels.cpu().numpy()
+                acc = (cls_pred == labels_np).mean()
+                msg_loss = f"loss: {loss:.4f}, Acc: {acc:.4f}"
+                bar.set_description(msg_loss)
+                scores["loss"].append(loss)
+                scores["acc"].append(acc)
 
-        return losses.avg, auc
+                # Save pred
+                for fname, uid, label, _pred in zip(
+                        fnames, uids, labels_np, pred
+                    ):
+                    preds.append([fname, uid, label[0], _pred[0]])
 
-    def get_loaders(self, df, fold):
-        train_data = df[df.fold != fold].reset_index(drop=True)
-        val_data = df[df.fold == fold].reset_index(drop=True)
-
-        train_data = MyDataset(train_data, transform=train_transform(self.augment_level),
-                               img_size=self.args.img_size)
-
-        val_data= MyDataset(val_data, transform=valid_transform(),
-                            img_size=self.args.img_size)
+        scores = {k: (np.mean(v) if isinstance(v, list) else v) for k, v in scores.items()}
         
-        train_loader = DataLoader(train_data,
-                                shuffle=True,
-                                num_workers=2,
-                                pin_memory=True,
-                                batch_size=self.args.batch_size)
+        return scores, preds
 
-        valid_loader = DataLoader(val_data,
-                                shuffle=False,
-                                num_workers=2,
-                                batch_size=self.args.batch_size)
-        
-        return (train_loader, len(train_data)), (valid_loader, len(val_data))
+    def train(self, train_loader, val_loader):
+        """Train process"""
+        cfg = self.cfg
+        output_dir = cfg.outdir
+        epochs = cfg.epochs
+        weight_dir = os.path.join(output_dir, "weights")
+        log_dir = os.path.join(output_dir, 'logs')
+        log_example_dir = os.path.join(log_dir, 'train_examples')
+        os.makedirs(weight_dir, exist_ok=True)
+        os.makedirs(log_example_dir, exist_ok=True)
 
-    def save_checkpoint(self, fold, score):
-        score = round(score, 2)
-        path = f'{self.args.model}_fold{fold}_{score}.pth'
-        old_ckp = glob.glob(os.path.join(
-            self.weight_dir, path.replace(f'{score}.pth', '*')))
+        self.init_logger(log_dir)
+        early_stop_counter = 0
+        best_ckp = os.path.join(weight_dir, f'{self.model_name}_best.pth')
 
-        for p in old_ckp:
-            os.remove(p)
-
-        torch.save(self.model.state_dict(), os.path.join(self.weight_dir, path))
-
-    def load_checkpoint(self, fold):
-        path = f'{self.args.model}_fold{fold}_*'
-        files = glob.glob(os.path.join(self.weight_dir, path))
-        if files:
-            self.model.load_state_dict(torch.load(files[0], map_location='cpu'))
-            log_info(f'Weight loaded from {files[0]}')
-        else:
-            log_info(f"No weight fold, pattern: {path}")
-
-    def train(self, train_df, fold, start_epoch=0, best_score=0, in_progress=False):
-        patient = 5 # Early stopping patient
-        if self.args.resume and not in_progress:
-            self.load_checkpoint(fold)
-
-        if in_progress: # Training is in progress, but augment level increased
-            log_info(f'Increase augmentation level from {self.augment_level} to {self.augment_level + 1}')
-            self.augment_level + 1
-
-        (train_loader, train_size), (valid_loader, val_size) = self.get_loaders(train_df, fold)
-
-        if not in_progress: # Start training
-            print(f'Train on {train_size} images, validate on {val_size} images')
-
-            steps_per_epoch = train_size // self.args.batch_size
-            self.optimizer = torch.optim.SGD(self.model.parameters(), lr=self.args.lr, momentum=0.9)
-            self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-                self.optimizer, verbose=True, T_max=self.args.epochs * steps_per_epoch
-            )
-
-        # Plot examples
-        for images, labels in train_loader:
-            images = deprocess(images)
-            labels = [LABELS[l] for l in labels]
-            plot_data(images, labels,
-                save_path=os.path.join(self.args.work_dir, 'train_sample.jpg'))
+        # Save some example
+        for sample in train_loader:
+            imgs = sample['image']
+            labels = sample['label']
+            uids = sample['uid']
+            for i in range(len(imgs)):
+                img, label, uid = imgs[i], labels[i], uids[i]
+                img = img.cpu().numpy().transpose(1, 2 ,0)
+                img = denorm(img)
+                text = f'{uid} - {label}'
+                save_path = os.path.join(log_example_dir, f"example_{i}.jpg")
+                put_text(img, text, save_path)
+                # cv2.imwrite(save_path, img)
+                if i >= 8:
+                    break
             break
-
-        not_improve_e = 0
-        for e in range(start_epoch, self.args.epochs):
-            train_loss, train_score = self.train_one_epoch(train_loader)
-
-            self.scheduler.step()
-
-            val_loss, val_score = self.val_one_epoch(valid_loader)
-
-            print((f'Epoch {e + 1}/{self.args.epochs}: Train loss {train_loss} - Train AUC {train_score}'
-                   f' - Val loss {val_loss} - Val AUC {val_score}'))
-
-            if val_score > best_score:
-                log_info(f'Valid score improved from {best_score} to {val_score}')
-                best_score = val_score
-                self.save_checkpoint(fold, val_score)
+        
+        # load pretraineds
+        start_epoch = 0
+        last_ckp = os.path.join(weight_dir, f'{self.model_name}_last.pth')
+        if cfg.resume:
+            if os.path.exists(last_ckp):
+                ckp = torch.load(last_ckp, map_location='cpu')
+                # self.optim.load_state_dict(ckp['optim'])
+                # self.scheduler.load_state_dict(ckp['scheduler'])
+                # load_my_state_dict(self.model, ckp)
+                self.model.load_state_dict(ckp)
+                start_epoch = 0
+                self.logger.info(f"Resume training from epoch {start_epoch}")
+                print(f"Resume training from epoch {start_epoch}")
             else:
-                not_improve_e += 1
+                self.logger.info(f"{last_ckp} not found, train from scratch")
+                print(f"{last_ckp} not found, train from scratch")
 
-            if not_improve_e == patient:
-                log_warn(f'Metric (Best = {best_score}) does not improve for {not_improve_e} epochs, stop training')
+        # Train
+        start = time.time()
+        self.model.to(self.device)
 
-            if  self.increase_augment_epochs and e == self.increase_augment_epochs[0]:
-                self.increase_augment_epochs.pop(0)
-                return self.train(train_df, fold, start_epoch=e + 1, best_score=best_score, in_progress=True)
+        for epoch in range(start_epoch, epochs):
+            train_scores = self.train_epoch(train_loader, epoch=epoch)
 
-        return best_score
+            do_valid = epoch % 1 == 0
+
+            if do_valid:
+                val_scores, preds = self.val_epoch(val_loader)
+                print(preds)
+                val_loss = val_scores["loss"]
+                val_acc = val_scores["acc"]
+                val_acc_vid = compute_video_metrics(preds)
+            lr = self.optim.param_groups[0]["lr"]
+            msg = f"Epoch {epoch + 1}/{epochs} (lr={lr:.5f})\nTrain "
+            msg += ", ".join([f"{k}: {v:.5f}" for k, v in train_scores.items()])
+
+            if do_valid:
+                if val_loss:
+                    msg += f"\nValid: loss {val_loss:.4f}, Acc {val_acc:.4f}, Acc_per_video {val_acc_vid:.4f}"
+
+            self.logger.info(msg)
+            # print(msg)
+            if self.scheduler is not None:
+                self.scheduler.step()
+
+            if do_valid:
+                score = val_loss
+                if epoch > 1:
+                    if score < self.best_score:
+                        m = f"Val Loss improved from {self.best_score:.4f} -> {score:.4f}, save model"
+                        self.logger.info(m)
+                        # print(m)
+                        self.best_score = score
+                        early_stop_counter = 0
+                        torch.save(self.model.state_dict(), best_ckp)
+                    else:
+                        early_stop_counter += 1
+
+                # if early_stop_counter >= 3:
+                #     print("Model doest not improve anymore, stop")
+                #     break
+
+            # Save last epoch
+            torch.save(self.model.state_dict(), last_ckp)
+
+        self.logger.info(f"Training is completed, elapsed: {(time.time() - start):.3f}s")
+        return best_ckp, val_loss

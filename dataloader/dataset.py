@@ -1,36 +1,64 @@
 import cv2
 import torch
+import os
 import numpy as np
+import glob
 from torch.utils.data import Dataset
 
 
-class MyDataset(Dataset):
-    def __init__(self, df, transform=None, img_size=512, return_path=False):
+class CustomDataset(Dataset):
+    def __init__(self, df, img_dir, transforms=None):
+        super(CustomDataset, self).__init__()
+        self.img_dir = img_dir
+        self.transforms = transforms
         self.df = df
-        self.transform = transform
-        self.img_size = img_size
-        self.return_path = return_path
 
     def __len__(self):
-        return(len(self.df))
+        return len(self.df)
 
     def __getitem__(self, idx):
-        path = self.df.loc[idx, 'path']
+        row = self.df.iloc[idx]
+        img_path = os.path.join(self.img_dir, row['image'])
+        label = row['liveness_score']
+        uid = row['uid']
+        img = cv2.imread(img_path)
+        assert img is not None, img_path
 
-        image = cv2.imread(path)[:,:,::-1].astype(np.uint8)
-        image = cv2.resize(image, (self.img_size, self.img_size))
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        if self.transforms is not None:
+            img = self.transforms(image=img)['image']
 
-        target = self.df.loc[idx, 'label']
-        target = torch.tensor(target)
+        img = np.transpose(img, (2, 0, 1))
+        img = torch.from_numpy(img)
+        label = torch.as_tensor([label])
+        return {
+            'image': img,
+            'uid': uid,
+            'fname': os.path.basename(img_path),
+            'label': label
+        }
 
-        if self.transform:
-            image = self.transform(image=image)['image']
+class InferDataset(Dataset):
+    def __init__(self, img_dir, transforms=None):
+        super(InferDataset, self).__init__()
+        self.img_files = glob.glob(os.path.join(img_dir, '**', '*'), recursive=True)
+        self.transforms = transforms
 
-        image = torch.tensor(image)
-        # Channel last -> channel first
-        image = image.permute(2, 0, 1)
+    def __len__(self):
+        return len(self.img_files)
 
-        if self.return_path:
-            return path, image, target
-        else:
-            return image, target
+    def __getitem__(self, idx):
+        img_path = self.img_files[idx]
+        img = cv2.imread(img_path)
+        assert img is not None, img_path
+
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        if self.transforms is not None:
+            img = self.transforms(image=img)['image']
+
+        img = np.transpose(img, (2, 0, 1))
+        img = torch.as_tensor(img)
+        return {
+            'image': img,
+            'fname': os.path.basename(img_path)
+        }
